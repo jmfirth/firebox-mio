@@ -25,6 +25,32 @@ use crate::{Interest, Token};
 
 cfg_net! {
     pub(crate) mod tcp {
+        // FIREBOX wasip1 net arm (CN8 / PE1 verdict A).
+        //
+        // WHY: mio 1.2.0's wasip1 backend ships *accept-only* because it is written
+        // against the standard `wasi` crate's preview1 ABI, whose socket surface is
+        // only `sock_accept/recv/send/shutdown` — there is no preview1 `sock_connect`,
+        // `sock_open`, or `sock_bind`. So upstream gates out `connect`/`bind`/`listen`
+        // and `TcpStream::connect`/`TcpListener::bind` on `(wasi, p1)`.
+        //
+        // Firebox is different: its libc/std fork routes `std::net` through the richer
+        // `wasix_32v1` namespace (`sock_open/connect/bind/listen/...`), so `std::net`
+        // outbound TCP works at runtime under `firebox run` TODAY (PE1 step 1+5 proof).
+        // We therefore implement the missing mio constructors over `std::net` — the
+        // exact `from_std` bridge PE1 proved drives async I/O through the wasip1
+        // `poll_oneoff` reactor — rather than over a preview1 ABI that lacks them.
+        //
+        // This keeps the arm zero-unsafe and reuses an already-proven path: every
+        // socket is created/connected/bound by `std::net`, set non-blocking, then
+        // handed (as a raw fd via `IoSource`/`Selector::register`) to the existing
+        // wasip1 reactor. No new substrate work — the substrate already exposes the
+        // full outbound socket surface.
+        //
+        // RETIREMENT: upstreamable to tokio-rs/mio as "wasip1 client sockets for hosts
+        // that expose connect/bind over the socket ABI" (firebox's wasix ABI is what
+        // makes the client side possible — a firebox-enabled-semantics gap). Retires
+        // when that lands AND firebox's vendored mio tracks it. Until then it lives in
+        // the codex `[patch.crates-io]` graph alongside socket2/libc.
         use std::io;
         use std::net::{self, SocketAddr};
 
@@ -33,8 +59,96 @@ cfg_net! {
             stream.set_nonblocking(true)?;
             Ok((stream, addr))
         }
+
+        /// Issue an outbound TCP connect. Returns a non-blocking, connected
+        /// `std::net::TcpStream` that the caller wraps in mio's `IoSource` and
+        /// registers with the `poll_oneoff` reactor.
+        ///
+        /// Unlike mio's unix arm (which issues a *non-blocking* `connect(2)` and
+        /// returns immediately with the connect still in flight), firebox's
+        /// `std::net::TcpStream::connect` completes the connect synchronously via
+        /// `wasix_32v1::sock_connect`. We then flip the socket to non-blocking so
+        /// subsequent reads/writes integrate with the reactor exactly like the
+        /// proven `from_std` path. This is observably equivalent for mio's
+        /// consumers (tokio waits for a writable event before using the stream;
+        /// an already-connected socket simply reports writable immediately).
+        pub(crate) fn connect(addr: SocketAddr) -> io::Result<net::TcpStream> {
+            let stream = net::TcpStream::connect(addr)?;
+            stream.set_nonblocking(true)?;
+            Ok(stream)
+        }
+
+        /// Bind + listen for an inbound TCP listener, returning a non-blocking
+        /// `std::net::TcpListener` registered with the reactor by the caller.
+        /// Routes through `wasix_32v1::sock_open/bind/listen`. `SO_REUSEADDR` is
+        /// applied via std before binding to match mio's unix `bind` shape.
+        pub(crate) fn bind(addr: SocketAddr) -> io::Result<net::TcpListener> {
+            // `TcpListener::bind` performs socket()+setsockopt(SO_REUSEADDR)+bind()+listen()
+            // in std on firebox's wasix-backed libc, mirroring mio's unix `bind`.
+            let listener = net::TcpListener::bind(addr)?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        }
     }
 }
+
+// FIREBOX wasip1 SourceFd arm (ESV / tokio::process backend).
+//
+// WHY: mio exposes `SourceFd` (an `event::Source` adapter over a borrowed `&RawFd`)
+// only on `unix`/`hermit`/non-p1-`wasi` — never on `(wasi, p1)`. tokio's `process`
+// imp registers its child pipe fds with the reactor through `mio::unix::SourceFd`;
+// to give tokio a wasip1 `process` arm we need the same adapter on this triple.
+//
+// The wasip1 `Selector::register/reregister/deregister` already take a raw `wasi::Fd`
+// (the same shape the unix `SourceFd` impl uses, just selector-first), so this adapter
+// is a thin, zero-unsafe mirror of `sys/unix/sourcefd.rs`. It registers ANY fd that
+// can be subscribed via `poll_oneoff` (FD_READ/FD_WRITE) — exactly what a nonblocking
+// child stdout/stderr/stdin pipe needs. Exposed via `mio::wasi::SourceFd` (see lib.rs).
+//
+// RETIREMENT: upstreamable to tokio-rs/mio alongside the CN8 wasip1 client-socket arm
+// ("wasip1 SourceFd for hosts that expose poll_oneoff fd readiness"). Retires when that
+// lands AND firebox's vendored mio tracks it.
+#[cfg(feature = "os-ext")]
+pub(crate) mod sourcefd {
+    use std::io;
+    use std::os::fd::RawFd;
+
+    use crate::{event, Interest, Registry, Token};
+
+    /// Adapter for [`RawFd`] providing an [`event::Source`] implementation on
+    /// `(wasi, p1)`. Mirrors `mio::unix::SourceFd`. Does **not** own the fd.
+    #[derive(Debug)]
+    pub struct SourceFd<'a>(pub &'a RawFd);
+
+    impl<'a> event::Source for SourceFd<'a> {
+        fn register(
+            &mut self,
+            registry: &Registry,
+            token: Token,
+            interests: Interest,
+        ) -> io::Result<()> {
+            registry.selector().register(*self.0 as _, token, interests)
+        }
+
+        fn reregister(
+            &mut self,
+            registry: &Registry,
+            token: Token,
+            interests: Interest,
+        ) -> io::Result<()> {
+            registry
+                .selector()
+                .reregister(*self.0 as _, token, interests)
+        }
+
+        fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+            registry.selector().deregister(*self.0 as _)
+        }
+    }
+}
+
+#[cfg(feature = "os-ext")]
+pub use sourcefd::SourceFd;
 
 /// Unique id for use as `SelectorId`.
 #[cfg(all(debug_assertions, feature = "net"))]

@@ -21,6 +21,8 @@ use crate::net::TcpStream;
 use crate::sys::tcp::set_reuseaddr;
 #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 use crate::sys::tcp::{bind, listen, new_for_addr};
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+use crate::sys::tcp::bind as wasip1_bind;
 use crate::{event, sys, Interest, Registry, Token};
 
 /// A structure representing a socket server
@@ -93,6 +95,18 @@ impl TcpListener {
         };
         listen(&listener.inner, backlog)?;
         Ok(listener)
+    }
+
+    /// FIREBOX wasip1 net arm (CN8 / PE1 verdict A): `bind` for `(wasi, p1)`.
+    ///
+    /// Upstream mio gates `bind` out on wasip1 (no preview1 `sock_bind`). Firebox's
+    /// libc routes `std::net::TcpListener::bind` (socket+SO_REUSEADDR+bind+listen)
+    /// through the wasix socket ABI, so we delegate to it and wrap the resulting
+    /// non-blocking listener in mio's `IoSource`. See `sys/wasip1/mod.rs`.
+    #[cfg(all(target_os = "wasi", target_env = "p1"))]
+    pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
+        let listener = wasip1_bind(addr)?;
+        Ok(TcpListener::from_std(listener))
     }
 
     /// Creates a new `TcpListener` from a standard `net::TcpListener`.

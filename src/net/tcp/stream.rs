@@ -15,6 +15,8 @@ use std::os::windows::io::{
 use crate::io_source::IoSource;
 #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
 use crate::sys::tcp::{connect, new_for_addr};
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+use crate::sys::tcp::connect as wasip1_connect;
 use crate::{event, Interest, Registry, Token};
 
 /// A non-blocking TCP stream between a local socket and a remote socket.
@@ -96,6 +98,19 @@ impl TcpStream {
         let stream = unsafe { TcpStream::from_raw_socket(socket as _) };
         connect(&stream.inner, addr)?;
         Ok(stream)
+    }
+
+    /// FIREBOX wasip1 net arm (CN8 / PE1 verdict A): `connect` for `(wasi, p1)`.
+    ///
+    /// Upstream mio gates `connect` out on wasip1 because its wasip1 backend has
+    /// no `sock_connect` (preview1 ABI). Firebox's libc routes `std::net` through
+    /// the wasix socket ABI, so we issue the connect via `std::net` and wrap the
+    /// resulting (non-blocking, connected) socket in mio's `IoSource` — the proven
+    /// `from_std` bridge, packaged as mio's `connect`. See `sys/wasip1/mod.rs`.
+    #[cfg(all(target_os = "wasi", target_env = "p1"))]
+    pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+        let stream = wasip1_connect(addr)?;
+        Ok(TcpStream::from_std(stream))
     }
 
     /// Creates a new `TcpStream` from a standard `net::TcpStream`.

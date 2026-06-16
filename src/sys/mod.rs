@@ -71,6 +71,11 @@ cfg_os_poll! {
 cfg_os_poll! {
     mod wasip1;
     pub(crate) use self::wasip1::*;
+    // FIREBOX (ESV): re-export the wasip1 SourceFd as `pub` so `mio::wasi::SourceFd`
+    // (lib.rs) can surface it on the `(wasi, p1)` triple — the `*` glob above only
+    // carries `pub(crate)` visibility, which `mio::wasi`'s `pub use` cannot re-export.
+    #[cfg(feature = "os-ext")]
+    pub use self::wasip1::SourceFd;
 }
 
 cfg_not_os_poll! {

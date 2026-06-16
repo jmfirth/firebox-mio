@@ -104,6 +104,19 @@ pub mod wasi {
     pub use crate::sys::SourceFd;
 }
 
+// FIREBOX wasip1 arm (ESV): the `(wasi, p1)` triple ships a `SourceFd` via the
+// wasip1 backend (`sys::wasip1::SourceFd`, re-exported through `sys::*`). Upstream's
+// `mio::wasi` is gated `not(target_env = "p1")`; firebox needs it on p1 so tokio's
+// `process` arm can register child pipe fds with the `poll_oneoff` reactor. RETIREMENT:
+// merges with the upstream `mio::wasi` module when wasip1 SourceFd lands upstream.
+#[cfg(all(target_os = "wasi", target_env = "p1", feature = "os-ext"))]
+#[cfg_attr(docsrs, doc(cfg(all(target_os = "wasi", feature = "os-ext"))))]
+pub mod wasi {
+    //! WASI (preview1) only extensions.
+
+    pub use crate::sys::SourceFd;
+}
+
 #[cfg(all(windows, feature = "os-ext"))]
 #[cfg_attr(docsrs, doc(cfg(all(windows, feature = "os-ext"))))]
 pub mod windows {
