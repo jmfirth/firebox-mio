@@ -82,7 +82,11 @@ pub struct Waker {
 impl Waker {
     /// Create a new `Waker`.
     pub fn new(registry: &Registry, token: Token) -> io::Result<Waker> {
-        #[cfg(debug_assertions)]
+        // FIREBOX (XWJ): the `has_waker` single-waker debug assertion (and its
+        // `register_waker` method) is gated `not(target_os = "wasi")` in poll.rs,
+        // so skip the call on wasi. tokio only ever creates one IO-driver waker,
+        // so the assertion adds nothing here.
+        #[cfg(all(debug_assertions, not(target_os = "wasi")))]
         registry.register_waker();
         sys::Waker::new(registry.selector(), token).map(|inner| Waker { inner })
     }

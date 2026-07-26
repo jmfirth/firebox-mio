@@ -159,6 +159,38 @@ pub(crate) struct Selector {
     id: usize,
     /// Subscriptions (reads events) we're interested in.
     subscriptions: Arc<Mutex<Vec<wasi::Subscription>>>,
+    // FIREBOX wasip1 cross-thread Waker arm (XWJ — boot lost-wake fix).
+    //
+    // WHY: upstream wasip1 mio ships *no* `Waker` ("there is no way to wake up a
+    // thread from calling `poll_oneoff`", see the module doc). Tokio's IO driver
+    // therefore makes `Handle::unpark()` an empty no-op on `target_os = "wasi"`,
+    // so any task woken from a *foreign* OS thread (a `spawn_blocking` worker, a
+    // sqlx-sqlite connection thread, a cross-worker mpsc send) cannot wake the
+    // worker blocked inside `poll_oneoff` — the wake is silently dropped and the
+    // awaiting future parks forever. This deterministically wedges codex-exec's
+    // in-process app-server boot at the first `spawn_blocking`
+    // (`resolve_installation_id`); `tid=1` parks `never-woken` with 0 sockets
+    // opened (XWJ breadcrumb proof).
+    //
+    // FIX: firebox's wasix ABI exposes the full outbound socket surface (the CN8
+    // arm above), so we can build a real self-pipe Waker over a 127.0.0.1
+    // loopback socket pair — exactly the mechanism mio's unix backend uses, just
+    // over `std::net` instead of `pipe2`. The receiver fd is registered with the
+    // reactor for FD_READ; `wake()` writes a byte from any thread, which makes
+    // the receiver readable and forces the in-flight `poll_oneoff` to return.
+    // The selector drains the receiver after every poll so the level-triggered
+    // `poll_oneoff` re-arms cleanly. Tokio's wasi `unpark()` is wired to this
+    // Waker (companion tokio-fork edit).
+    //
+    // RETIREMENT: retires when upstream tokio-rs/mio gains a real wasip1 Waker
+    // (the same "wasip1 wakeups for hosts that expose a pollable socket/fd ABI"
+    // upstreamable as the CN8 socket arm) AND firebox's vendored mio tracks it.
+    /// Receiver fd + its userdata (token) of the active cross-thread `Waker`, if
+    /// one is registered. Drained after a `poll_oneoff` that reported the waker
+    /// fd readable, so the level-triggered reactor re-arms. The userdata lets
+    /// `select()` drain ONLY when the waker actually fired (a blind drain on a
+    /// blocking pipe with no pending byte would deadlock the reactor).
+    waker_receiver_fd: Arc<Mutex<Option<(wasi::Fd, wasi::Userdata)>>>,
 }
 
 impl Selector {
@@ -167,6 +199,7 @@ impl Selector {
             #[cfg(all(debug_assertions, feature = "net"))]
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             subscriptions: Arc::new(Mutex::new(Vec::new())),
+            waker_receiver_fd: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -224,6 +257,24 @@ impl Selector {
                     }
                 }
 
+                // FIREBOX (XWJ): if a cross-thread `Waker` is registered AND its
+                // fd actually fired in this poll, drain it. The wasip1 reactor is
+                // level-triggered (each `poll_oneoff` re-reads the whole
+                // subscription list), so an undrained readable waker byte would
+                // make every subsequent poll return immediately and busy-spin.
+                // We drain ONLY when the waker event is present: the read-end is a
+                // blocking pipe, so a blind drain when no byte is queued would
+                // wedge the reactor. The waker's TOKEN_WAKEUP event is left in
+                // `events` for tokio's `turn` to recognize and ignore.
+                if let Ok(guard) = self.waker_receiver_fd.lock() {
+                    if let Some((fd, userdata)) = *guard {
+                        let waker_fired = events.iter().any(|e| e.userdata == userdata);
+                        if waker_fired {
+                            drain_waker_fd(fd);
+                        }
+                    }
+                }
+
                 check_errors(&events)
             }
             Err(err) => Err(io_err(err)),
@@ -235,6 +286,9 @@ impl Selector {
             #[cfg(all(debug_assertions, feature = "net"))]
             id: self.id,
             subscriptions: self.subscriptions.clone(),
+            // FIREBOX (XWJ): share the same waker receiver fd across clones so a
+            // `Waker` registered on the cloned registry drains correctly.
+            waker_receiver_fd: self.waker_receiver_fd.clone(),
         })
     }
 
@@ -316,7 +370,180 @@ impl Selector {
 
         ret
     }
+
+    /// FIREBOX (XWJ): record the receiver fd + its userdata (token) of the active
+    /// cross-thread `Waker` so `select()` drains it after a `poll_oneoff` that
+    /// reported it readable (re-arming the level-triggered reactor). Called by
+    /// `Waker::new`.
+    pub(crate) fn set_waker_fd(&self, fd: wasi::Fd, userdata: wasi::Userdata) {
+        if let Ok(mut guard) = self.waker_receiver_fd.lock() {
+            *guard = Some((fd, userdata));
+        }
     }
+
+    /// FIREBOX (XWJ): clear the waker receiver fd when the `Waker` is dropped.
+    pub(crate) fn clear_waker_fd(&self, fd: wasi::Fd) {
+        if let Ok(mut guard) = self.waker_receiver_fd.lock() {
+            if matches!(*guard, Some((f, _)) if f == fd) {
+                *guard = None;
+            }
+        }
+    }
+    }
+}
+
+// FIREBOX wasip1 cross-thread Waker (XWJ — boot lost-wake fix). See the rationale
+// on `Selector::waker_receiver_fd` above. Mirrors mio's unix pipe waker, backed by
+// an anonymous `pipe(2)` (firebox's wasix-libc exports `pipe`/`__wasi_fd_pipe`).
+//
+// NB: a pipe — NOT a loopback TCP socket pair — is required, because firebox's
+// `--net` is default-deny for INBOUND sockets (firebox#647), so binding a loopback
+// listener fails with EPERM; a pipe needs no listener and works regardless of the
+// networking posture (and even with no `--net` at all).
+//
+// RETIREMENT: retires when upstream tokio-rs/mio ships a real wasip1 Waker AND
+// firebox's vendored mio tracks it.
+cfg_io_source! {
+    pub(crate) mod waker {
+        use std::fmt;
+        use std::io;
+        use std::sync::Mutex;
+
+        use crate::sys::Selector;
+        use crate::Token;
+
+        unsafe extern "C" {
+            // firebox wasix-libc exports POSIX `pipe`; `write`/`close` are the
+            // standard libc fd ops (all confirmed defined symbols in the
+            // self-contained wasix-libc the firebox sysroot ships).
+            //
+            // NB: deliberately NO `fcntl` here. wasi-libc's `fcntl` is VARIADIC
+            // (`fcntl(fd, cmd, ...)`); calling it through a fixed-arity Rust
+            // `extern "C"` mismatches the wasm variadic ABI and traps with an
+            // out-of-bounds memory access. We keep the read-end blocking and drain
+            // it correctly without O_NONBLOCK (see `drain_waker_fd`).
+            fn pipe(fds: *mut i32) -> i32;
+            fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+            fn close(fd: i32) -> i32;
+        }
+
+        /// Cross-thread `Waker` backed by an anonymous pipe.
+        ///
+        /// The read-end (`receiver_fd`) is registered with the reactor for
+        /// FD_READ; a `wake()` from any thread writes a byte to the write-end
+        /// (`sender_fd`), making the read-end readable and forcing the in-flight
+        /// `poll_oneoff` to return. The selector drains the read-end after the
+        /// poll so the level-triggered reactor re-arms.
+        pub(crate) struct Waker {
+            sender_fd: i32,
+            receiver_fd: wasi::Fd,
+            // Serialize concurrent `wake()` writes; a pipe write of 1 byte is
+            // atomic, but the lock keeps the API `Sync`-safe and cheap.
+            write_lock: Mutex<()>,
+            selector: Selector,
+        }
+
+        impl fmt::Debug for Waker {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct("Waker")
+                    .field("receiver_fd", &self.receiver_fd)
+                    .field("sender_fd", &self.sender_fd)
+                    .finish()
+            }
+        }
+
+        impl Waker {
+            pub(crate) fn new(selector: &Selector, token: Token) -> io::Result<Waker> {
+                let mut fds = [-1i32; 2];
+                // Safety: `fds` is a 2-element array; `pipe` writes the read fd to
+                // fds[0] and the write fd to fds[1], returning 0 on success.
+                let rc = unsafe { pipe(fds.as_mut_ptr()) };
+                if rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let receiver_fd = fds[0] as wasi::Fd;
+                let sender_fd = fds[1];
+
+                let selector = selector.try_clone()?;
+                // Register the read-end for readable readiness under `token`
+                // (tokio passes TOKEN_WAKEUP). The selector drains this fd after
+                // every poll; the fds stay open for the lifetime of the reactor
+                // (the Waker is process-lived, like the IO driver). On `Drop` we
+                // deregister + close both ends.
+                if let Err(e) = selector.register(receiver_fd, token, crate::Interest::READABLE) {
+                    unsafe {
+                        close(fds[0]);
+                        close(sender_fd);
+                    }
+                    return Err(e);
+                }
+                // `register` stores the FD_READ subscription under `token.0` as
+                // its `userdata`; record both so `select()` can detect the waker
+                // event and drain only then.
+                selector.set_waker_fd(receiver_fd, token.0 as wasi::Userdata);
+
+                Ok(Waker {
+                    sender_fd,
+                    receiver_fd,
+                    write_lock: Mutex::new(()),
+                    selector,
+                })
+            }
+
+            pub(crate) fn wake(&self) -> io::Result<()> {
+                // A single byte makes the read-end readable; the selector drains
+                // it after the poll returns. The lock just serializes writers.
+                let _guard = self
+                    .write_lock
+                    .lock()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "waker write lock poisoned"))?;
+                let byte = 1u8;
+                // Safety: `sender_fd` is the live write-end of our pipe.
+                let n = unsafe { write(self.sender_fd, &byte as *const u8, 1) };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    // A full pipe buffer means a wakeup is already pending — that
+                    // is exactly the effect we want, so treat WouldBlock as success.
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+                Ok(())
+            }
+        }
+
+        impl Drop for Waker {
+            fn drop(&mut self) {
+                self.selector.clear_waker_fd(self.receiver_fd);
+                let _ = self.selector.deregister(self.receiver_fd);
+                // Safety: we own both ends; close them once.
+                unsafe {
+                    close(self.receiver_fd as i32);
+                    close(self.sender_fd);
+                }
+            }
+        }
+    }
+    pub(crate) use waker::Waker;
+}
+
+/// FIREBOX (XWJ): drain the waker receiver (pipe read-end) with a single bounded
+/// read. Called by `Selector::select` ONLY when `poll_oneoff` reported the waker
+/// fd readable, so at least one byte is queued and this read returns immediately
+/// (it never blocks — no `O_NONBLOCK`/`fcntl` needed). A single read consumes up
+/// to `buf.len()` bytes; any residual coalesced wake bytes simply re-fire the
+/// next poll, which is harmless (the worker is already being woken). Best-effort.
+#[cfg(all(feature = "os-poll", any(feature = "net", feature = "os-ext")))]
+fn drain_waker_fd(fd: wasi::Fd) {
+    unsafe extern "C" {
+        fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    }
+    let mut buf = [0u8; 64];
+    // Safety: `fd` is the pipe read-end, kept open for the reactor's lifetime by
+    // the `Waker`. Borrowed transiently for one read; the read is guaranteed
+    // non-blocking by the caller's contract (only invoked after a readable event).
+    let _ = unsafe { read(fd as i32, buf.as_mut_ptr(), buf.len()) };
 }
 
 /// Token used to a add a timeout subscription, also used in removing it again.

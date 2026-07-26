@@ -51,7 +51,17 @@ mod interest;
 mod poll;
 mod sys;
 mod token;
-#[cfg(not(target_os = "wasi"))]
+// FIREBOX (XWJ): on `(wasi, p1)` we now provide a real `sys::Waker` (a loopback
+// socket-pair self-pipe — see `sys/wasip1/mod.rs`), so the cross-platform `Waker`
+// facade compiles and works on wasi. Upstream gated `mod waker` out of wasi
+// because wasip1 mio shipped no `sys::Waker`. The added `(wasi, p1, os-poll)` arm
+// re-enables it (our `sys::Waker` lives under `cfg_io_source!`, which requires
+// `os-poll` + net/os-ext). RETIREMENT: drops back to the upstream
+// `not(target_os = "wasi")` gate when upstream mio ships its own wasip1 Waker.
+#[cfg(any(
+    not(target_os = "wasi"),
+    all(target_os = "wasi", target_env = "p1", feature = "os-poll")
+))]
 mod waker;
 
 pub mod event;
@@ -69,7 +79,11 @@ pub use event::Events;
 pub use interest::Interest;
 pub use poll::{Poll, Registry};
 pub use token::Token;
-#[cfg(not(target_os = "wasi"))]
+// FIREBOX (XWJ): expose `mio::Waker` on `(wasi, p1)` too — see `mod waker` above.
+#[cfg(any(
+    not(target_os = "wasi"),
+    all(target_os = "wasi", target_env = "p1", feature = "os-poll")
+))]
 pub use waker::Waker;
 
 #[cfg(all(unix, feature = "os-ext"))]
