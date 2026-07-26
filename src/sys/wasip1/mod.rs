@@ -172,10 +172,12 @@ pub(crate) struct Selector {
     // (`resolve_installation_id`); `tid=1` parks `never-woken` with 0 sockets
     // opened (XWJ breadcrumb proof).
     //
-    // FIX: firebox's wasix ABI exposes the full outbound socket surface (the CN8
-    // arm above), so we can build a real self-pipe Waker over a 127.0.0.1
-    // loopback socket pair — exactly the mechanism mio's unix backend uses, just
-    // over `std::net` instead of `pipe2`. The receiver fd is registered with the
+    // FIX: firebox's wasix-libc exports a real POSIX `pipe(2)`, so we can build a
+    // genuine self-pipe Waker — exactly the mechanism mio's unix backend uses.
+    // (A 127.0.0.1 loopback socket pair was tried FIRST and rejected: binding a
+    // listener trips firebox's inbound default-deny under `--net` (firebox#647,
+    // EPERM). A pipe needs no listener and works with no networking at all — see
+    // the `mod waker` header for the full account.) The receiver fd is registered with the
     // reactor for FD_READ; `wake()` writes a byte from any thread, which makes
     // the receiver readable and forces the in-flight `poll_oneoff` to return.
     // The selector drains the receiver after every poll so the level-triggered

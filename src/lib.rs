@@ -51,8 +51,8 @@ mod interest;
 mod poll;
 mod sys;
 mod token;
-// FIREBOX (XWJ): on `(wasi, p1)` we now provide a real `sys::Waker` (a loopback
-// socket-pair self-pipe — see `sys/wasip1/mod.rs`), so the cross-platform `Waker`
+// FIREBOX (XWJ): on `(wasi, p1)` we now provide a real `sys::Waker` (an anonymous
+// `pipe(2)` self-pipe — see `sys/wasip1/mod.rs`), so the cross-platform `Waker`
 // facade compiles and works on wasi. Upstream gated `mod waker` out of wasi
 // because wasip1 mio shipped no `sys::Waker`. The added `(wasi, p1, os-poll)` arm
 // re-enables it (our `sys::Waker` lives under `cfg_io_source!`, which requires
