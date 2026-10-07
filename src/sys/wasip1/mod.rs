@@ -591,8 +591,17 @@ fn check_errors(events: &[Event]) -> io::Result<()> {
 
 /// Convert `wasi::Errno` into an `io::Error`.
 fn io_err(errno: wasi::Errno) -> io::Error {
-    // TODO: check if this is valid.
-    io::Error::from_raw_os_error(errno.raw() as i32)
+    // firebox#YZE: WASI returns wire errno, while the WASIX libc and std
+    // expose Linux errno. Keep plain WASI's original numbering.
+    #[cfg(target_vendor = "wasmer")]
+    unsafe extern "C" {
+        fn __wasilibc_errno_from_wasi(code: u16) -> i32;
+    }
+    #[cfg(target_vendor = "wasmer")]
+    let code = unsafe { __wasilibc_errno_from_wasi(errno.raw()) };
+    #[cfg(not(target_vendor = "wasmer"))]
+    let code = errno.raw() as i32;
+    io::Error::from_raw_os_error(code)
 }
 
 pub(crate) type Events = Vec<Event>;
@@ -707,6 +716,23 @@ cfg_os_poll! {
                 // return.
                 f(io)
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_vendor = "wasmer"))]
+mod errno_numbering_tests {
+    #[test]
+    fn wire_errors_become_linux_errors() {
+        for (wire, raw, kind) in [
+            (wasi::ERRNO_NOENT, 2, std::io::ErrorKind::NotFound),
+            (wasi::ERRNO_INTR, 4, std::io::ErrorKind::Interrupted),
+            (wasi::ERRNO_ACCES, 13, std::io::ErrorKind::PermissionDenied),
+            (wasi::ERRNO_AGAIN, 11, std::io::ErrorKind::WouldBlock),
+        ] {
+            let error = super::io_err(wire);
+            assert_eq!(error.raw_os_error(), Some(raw));
+            assert_eq!(error.kind(), kind);
         }
     }
 }
